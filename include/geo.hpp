@@ -166,4 +166,25 @@ inline std::vector<Polygon> randomPolygons(size_t n, uint64_t seed, double rMinK
     return polys;
 }
 
+// Drivers sending GPS pings: each move picks a random driver and walks it 50 to 200 m in a
+// random direction, clamped to the region. Applies the moves to pts and returns them in order,
+// so the same driver can move several times and `from` is always its current position.
+struct Move { uint32_t id; Point from, to; };
+
+inline std::vector<Move> randomMoves(std::vector<Point>& pts, size_t n, uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<uint32_t> pick(0, uint32_t(pts.size() - 1));
+    std::uniform_real_distribution<double> step(0.05, 0.2), angle(0, 2 * std::numbers::pi);
+    std::vector<Move> moves(n);
+    for (auto& m : moves) {
+        m.id = pick(rng);
+        m.from = pts[m.id];
+        double d = step(rng), t = angle(rng);
+        m.to = {std::clamp(m.from.lat + d * std::sin(t) / kKmPerDegLat, kRegion.minLat, kRegion.maxLat),
+                std::clamp(m.from.lng + d * std::cos(t) / kKmPerDegLng, kRegion.minLng, kRegion.maxLng)};
+        pts[m.id] = m.to;
+    }
+    return moves;
+}
+
 }  // namespace geo

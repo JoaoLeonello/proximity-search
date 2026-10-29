@@ -93,3 +93,56 @@ _avg 281.9 results/query_
 | R-tree (STR) | 61.12 | 16,361 | 2.3× | ✅ |
 
 All structures match the naive scan. ✅
+
+## Scenario 7: moving drivers
+
+`1,000,000 points · 20,000 updates · 2,000 queries · AMD Ryzen 7 7735HS (laptop) · g++ 14.2 -O3 -march=native · Debian`
+
+Run on a different machine from the results above. Compare rows within these tables only.
+
+### Build: moving drivers (dynamic indexes)
+
+| Structure | build (ms) |
+|---|---:|
+| Naive scan | 0.0 |
+| B-tree (lat) | 143.3 |
+| Geohash | 134.0 |
+| Quadtree | 315.9 |
+| R-tree (Guttman) | 1014.4 |
+
+### 7. Moving drivers: location updates
+
+_20,000 location updates_
+
+| Structure | µs / update | updates / s |
+|---|---:|---:|
+| B-tree (lat) | 2.09 | 477,886 |
+| Geohash | 1.79 | 559,623 |
+| Quadtree | 0.83 | 1,200,711 |
+| R-tree (Guttman) | 14.65 | 68,238 |
+
+### 7a. After the moves: radius 500 m
+
+_avg 959.8 results/query_
+
+| Structure | µs / query | queries / s | vs naive | correct |
+|---|---:|---:|---:|:---:|
+| Naive scan | 1196.55 | 836 | 1.0× | ✅ |
+| B-tree (lat) | 148.76 | 6,722 | 8.0× | ✅ |
+| Geohash | 25.19 | 39,704 | 47.5× | ✅ |
+| **Quadtree** | **21.71** | 46,063 | 55.1× | ✅ |
+| R-tree (Guttman) | 106.17 | 9,419 | 11.3× | ✅ |
+
+### 7b. After the moves: k = 1
+
+_avg 1.0 results/query_
+
+| Structure | µs / query | queries / s | vs naive | correct |
+|---|---:|---:|---:|:---:|
+| Naive scan | 1755.26 | 570 | 1.0× | ✅ |
+| B-tree (lat) | 84.28 | 11,865 | 20.8× | ✅ |
+| Geohash | 20.10 | 49,755 | 87.3× | ✅ |
+| **Quadtree** | **1.15** | 870,009 | 1527.1× | ✅ |
+| R-tree (Guttman) | 80.38 | 12,440 | 21.8× | ✅ |
+
+All structures match the naive scan. ✅

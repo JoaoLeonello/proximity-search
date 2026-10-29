@@ -30,6 +30,7 @@ There is no single fastest structure. Each scenario has a different winner, and 
 | Point in polygon | Geohash | R-tree | One hash lookup; no tree to descend |
 | Polygon overlap | three-way tie | | ~280 hits per query, so the exact polygon test dominates |
 | Build time | Geohash / B-tree | | Just a sort |
+| Moving drivers (location updates) | Quadtree | Geohash, B-tree | A move is a local remove + insert in one leaf; the R-tree pays for overlapping boxes |
 
 If you can only pick one, pick the R-tree. It is never far from first place in any scenario, and it indexes rectangles natively, which is why PostGIS uses an R-tree-like GiST index. Pick a geohash when you need cheap writes, easy sharding, or Redis (`GEOADD`/`GEOSEARCH` is a geohash over a sorted set). Pick a quadtree for an in-memory "find the nearest" service over very uneven data.
 
@@ -111,8 +112,17 @@ The dataset is a 50 × 50 km box over greater São Paulo. 70% of the points sit 
 | 4 | 20 nearest points | 20 closest stores |
 | 5 | Zones containing a point | Which delivery zones cover this address? |
 | 6 | Zones overlapping a polygon | Which existing zones does a new zone collide with? |
+| 7 | 20,000 location updates, then scenarios 1 and 3 again | Drivers sending GPS pings |
 
 Zones are 20,000 convex polygons with 5 to 8 vertices and radii of 0.2 to 1.5 km. Scenario 6 queries with polygons of 0.5 to 3 km. Polygon tests are exact (separating axis theorem), not bounding-box approximations.
+
+In scenario 7, a random driver moves 50 to 200 m in a random direction, 20,000 times (10 per query, so the same driver can move more than once). The static indexes above can't take updates, so this scenario uses dynamic versions of each one:
+
+- B-tree and geohash keep their rows in a paged B+tree ([`paged.hpp`](include/paged.hpp)): sorted pages of up to 256 rows, like database leaf pages. A move is an erase plus an insert that touches one page.
+- The quadtree removes the point from its leaf and inserts it again. Its root covers the whole region, so a driver can move anywhere in it.
+- The R-tree is a classic dynamic R-tree (Guttman 1984): least-enlargement insert, quadratic split, and reinsertion of the points of underfull nodes on delete. The STR tree can only be rebuilt.
+
+After the moves, every dynamic index answers scenarios 1 and 3 on the moved data and is checked against the naive scan like everything else.
 
 ## Results
 
@@ -186,6 +196,29 @@ _avg 282 zones/query_
 | Quadtree | 56.57 | 17,676 | 2.5× | ✅ |
 | R-tree (STR) | 61.12 | 16,361 | 2.3× | ✅ |
 
+### 7. Moving drivers
+
+`1,000,000 points · 20,000 updates · 2,000 queries · AMD Ryzen 7 7735HS (laptop) · g++ 14.2 -O3 -march=native · Debian`
+
+This scenario ran on a different machine from the tables above, so compare rows within each table and not with the other sections. On this laptop the static STR R-tree does the 500 m radius in about 21 µs and k = 1 in about 3 µs. Updates run once, since they change the index, so there is no best of 3.
+
+| Structure | µs / update | updates / s |
+|---|---:|---:|
+| B-tree (lat) | 2.09 | 477,886 |
+| Geohash | 1.79 | 559,623 |
+| **Quadtree** | **0.83** | 1,200,711 |
+| R-tree (Guttman) | 14.65 | 68,238 |
+
+After the moves:
+
+| Structure | radius 500 m (µs) | k = 1 (µs) | correct |
+|---|---:|---:|:---:|
+| Naive scan | 1196.55 | 1755.26 | ✅ |
+| B-tree (lat) | 148.76 | 84.28 | ✅ |
+| Geohash | 25.19 | 20.10 | ✅ |
+| **Quadtree** | **21.71** | **1.15** | ✅ |
+| R-tree (Guttman) | 106.17 | 80.38 | ✅ |
+
 ### Build time
 
 | Structure | 1M points (ms) | 20k zones (ms) |
@@ -207,6 +240,10 @@ Point in polygon favours the grid. The geohash index answers with one hash looku
 
 Polygon overlap is a three-way tie because each query returns about 280 zones, and the exact SAT test on those candidates costs more than finding them.
 
+Under moving points the quadtree has the cheapest updates and the fastest nearest neighbour. On the 500 m radius it and the geohash are within noise of each other; in a separate run with zero moves the geohash came first. A quadtree move touches one leaf: remove the id, insert it into the leaf that now contains the point. The geohash and the B-tree are close behind on updates, at about 2 µs, because a move is an erase and an insert in one sorted page. The dynamic R-tree is 8 times slower than the geohash per update. Two things in its code cost time: its boxes overlap, so finding the leaf that holds a point can mean descending more than one branch, and every insert and delete recomputes boxes up to the root. The R-tree losing on churn matches the usual advice to use encoded cells for moving points and R-trees for shapes. The quadtree beating the geohash in memory doesn't overturn that advice, because the geohash's other advantages don't show up here: it works on any sorted index in any database, and its prefixes shard.
+
+The dynamic R-tree is also 5 to 26 times slower at queries than the STR tree. That cost comes from building it one insert at a time, not from the moves. With zero moves it already takes 121 µs on the 500 m radius and 85 µs on k = 1, and 20,000 moves (2% of the points) left every index within run-to-run noise. Quadratic splits leave more overlap than STR packing, and an R*-tree's insertion rules would narrow the gap. This benchmark does not include one.
+
 Building is cheapest for the flat indexes. The geohash and B-tree are a single sort. The quadtree allocates a `std::vector` per node, and the R-tree sorts once per level.
 
 ## Methodology and fairness
@@ -215,6 +252,7 @@ Building is cheapest for the flat indexes. The geohash and B-tree are a single s
 - Every point index keeps coordinates inline next to the id, so none of them wins or loses on cache misses alone.
 - Distances use an equirectangular projection at São Paulo's latitude (within ~0.3% of haversine at city scale). Because it is exact in its own plane, results can be compared bit for bit and box pruning is a true lower bound.
 - Tunables: leaf capacity 32 (quadtree), fan-out 16 (R-tree), 26 bits per axis (geohash), 14-bit cells for geohash zones. These are reasonable defaults and were not tuned to make any structure win.
+- Location updates in scenario 7 run once per index, because they change the index. The dynamic indexes are only used in scenario 7, so the static numbers are unaffected.
 - Runs are single-threaded, best of 3, with no other warm-up. Timings on WSL2 move by about ±10% between runs, so treat gaps smaller than that as ties.
 
 ## Run it
@@ -234,17 +272,19 @@ The only requirement is a C++20 compiler.
 include/
   geo.hpp          points, boxes, convex polygons, SAT, k-NN heap, data generators
   naive.hpp        brute-force baseline (the oracle)
-  btree_index.hpp  sorted-by-latitude range scan
-  geohash.hpp      Morton-coded geohash for points + cell hash map for zones
-  quadtree.hpp     point quadtree + MX-CIF quadtree for zones
-  rtree.hpp        STR bulk-loaded R-tree for points and zones
+  btree_index.hpp  sorted-by-latitude range scan, static and moving
+  geohash.hpp      Morton-coded geohash for points (static and moving) + cell hash map for zones
+  paged.hpp        two-level paged B+tree behind the moving B-tree and geohash
+  quadtree.hpp     point quadtree (static and moving) + MX-CIF quadtree for zones
+  rtree.hpp        STR bulk-loaded R-tree for points and zones + dynamic Guttman R-tree
 src/bench.cpp      scenarios, timing, verification, Markdown output
 results.md         raw output of the run above
 ```
 
 ## What is not covered
 
-- Updates: All indexes are built once. Moving drivers would favour the geohash (re-sort one key) and the quadtree (local insert and delete) over a bulk-loaded R-tree, which would need R*-tree style inserts.
+- R*-tree: the dynamic R-tree in scenario 7 uses Guttman's quadratic split. R*-tree insertion (forced reinsert, overlap-aware splits) builds better trees and would be the fairer dynamic R-tree.
+- Long-lived churn: scenario 7 moves 2% of the points. The quadtree never merges emptied quadrants and the dynamic R-tree never frees unlinked nodes, which is fine at that scale but would need fixing for a service that runs for weeks.
 - Disk and distribution: Everything is in memory. On disk, page-sized R-tree nodes and geohash range scans are what databases use, and geohash prefixes shard trivially.
 - The whole globe: The planar metric and the 3×3 geohash neighbourhood assume one city, far from the poles and the antimeridian.
 - Other structures, such as k-d trees, S2/H3 cells, and uniform grids.

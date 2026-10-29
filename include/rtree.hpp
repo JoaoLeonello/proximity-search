@@ -130,3 +130,214 @@ struct RTreePoly {
                     [&](uint32_t id) { if (geo::intersects((*polys)[id], q)) out.push_back(id); });
     }
 };
+
+// Dynamic R-tree for moving points (Guttman 1984): insert descends to the leaf that needs the
+// least enlargement and splits overflowing nodes with the quadratic split; delete finds the
+// leaf, removes the entry and reinserts the points of any node that drops below kMin. This is
+// the insert/delete path a GiST index takes; the STR tree above can only be rebuilt.
+struct DynamicRTree {
+    static constexpr const char* name = "R-tree (Guttman)";
+    static constexpr size_t kMax = 16, kMin = 6;
+    struct Item { geo::Point p; uint32_t id; };
+    struct Node {
+        geo::BBox box;
+        int32_t parent = -1;
+        bool leaf = true;
+        std::vector<Item> items;     // leaf
+        std::vector<int32_t> kids;   // internal
+    };
+    // shortcut: nodes dropped by condense() stay in the vector unused; add a free list for long runs.
+    std::vector<Node> nodes;
+    int32_t root = 0;
+
+    static geo::BBox pointBox(geo::Point p) { return {p.lat, p.lng, p.lat, p.lng}; }
+    static double area(const geo::BBox& b) { return (b.maxLat - b.minLat) * (b.maxLng - b.minLng); }
+    static double enlargement(geo::BBox b, const geo::BBox& add) {
+        double before = area(b);
+        b.expand(add);
+        return area(b) - before;
+    }
+
+    void recompute(int32_t n) {
+        geo::BBox b;
+        for (const Item& it : nodes[n].items) b.expand(it.p);
+        for (int32_t k : nodes[n].kids) b.expand(nodes[k].box);
+        nodes[n].box = b;
+    }
+
+    // Quadratic split: seed the two groups with the pair that would waste the most area together,
+    // then hand out the rest, most decided entry first. `a` keeps one group; the other is returned.
+    template <class T, class BoxOf>
+    static std::vector<T> quadraticSplit(std::vector<T>& a, BoxOf boxOf) {
+        std::vector<T> all = std::move(a), b;
+        a.clear();
+        size_t s1 = 0, s2 = 1;
+        double worst = -geo::kInf;
+        for (size_t i = 0; i < all.size(); ++i)
+            for (size_t j = i + 1; j < all.size(); ++j) {
+                geo::BBox u = boxOf(all[i]);
+                u.expand(boxOf(all[j]));
+                double waste = area(u) - area(boxOf(all[i])) - area(boxOf(all[j]));
+                if (waste > worst) worst = waste, s1 = i, s2 = j;
+            }
+        geo::BBox ba = boxOf(all[s1]), bb = boxOf(all[s2]);
+        a.push_back(all[s1]);
+        b.push_back(all[s2]);
+        std::vector<bool> used(all.size());
+        used[s1] = used[s2] = true;
+        for (size_t left = all.size() - 2; left > 0; --left) {
+            // One group needs every remaining entry to reach kMin: give them all to it.
+            if (a.size() + left == kMin || b.size() + left == kMin) {
+                auto& g = a.size() + left == kMin ? a : b;
+                for (size_t i = 0; i < all.size(); ++i)
+                    if (!used[i]) g.push_back(all[i]);
+                break;
+            }
+            size_t pick = 0;
+            double best = -1, ea = 0, eb = 0;
+            for (size_t i = 0; i < all.size(); ++i) {
+                if (used[i]) continue;
+                double da = enlargement(ba, boxOf(all[i])), db = enlargement(bb, boxOf(all[i]));
+                if (std::abs(da - db) > best) best = std::abs(da - db), pick = i, ea = da, eb = db;
+            }
+            used[pick] = true;
+            bool toA = ea != eb ? ea < eb : area(ba) != area(bb) ? area(ba) < area(bb) : a.size() <= b.size();
+            (toA ? a : b).push_back(all[pick]);
+            (toA ? ba : bb).expand(boxOf(all[pick]));
+        }
+        return b;
+    }
+
+    // Walk from n to the root, tightening boxes and splitting any node over kMax.
+    void adjustUp(int32_t n) {
+        for (; n >= 0; n = nodes[n].parent) {
+            if ((nodes[n].leaf ? nodes[n].items.size() : nodes[n].kids.size()) <= kMax) {
+                recompute(n);
+                continue;
+            }
+            int32_t sib = int32_t(nodes.size());
+            nodes.push_back({});
+            nodes[sib].leaf = nodes[n].leaf;
+            if (nodes[n].leaf) {
+                nodes[sib].items = quadraticSplit(nodes[n].items, [](const Item& it) { return pointBox(it.p); });
+            } else {
+                nodes[sib].kids = quadraticSplit(nodes[n].kids, [&](int32_t k) { return nodes[k].box; });
+                for (int32_t k : nodes[sib].kids) nodes[k].parent = sib;
+            }
+            recompute(n);
+            recompute(sib);
+            if (nodes[n].parent < 0) {  // root split: the tree grows one level
+                int32_t r = int32_t(nodes.size());
+                nodes.push_back({});
+                nodes[r].leaf = false;
+                nodes[r].kids = {n, sib};
+                nodes[n].parent = nodes[sib].parent = r;
+                recompute(r);
+                root = r;
+                return;
+            }
+            nodes[sib].parent = nodes[n].parent;
+            nodes[nodes[n].parent].kids.push_back(sib);
+        }
+    }
+
+    void insert(geo::Point p, uint32_t id) {
+        int32_t n = root;
+        while (!nodes[n].leaf) {
+            int32_t best = -1;
+            double bestGrow = geo::kInf, bestArea = geo::kInf;
+            for (int32_t k : nodes[n].kids) {
+                double g = enlargement(nodes[k].box, pointBox(p)), a = area(nodes[k].box);
+                if (g < bestGrow || (g == bestGrow && a < bestArea)) best = k, bestGrow = g, bestArea = a;
+            }
+            n = best;
+        }
+        nodes[n].items.push_back({p, id});
+        adjustUp(n);
+    }
+
+    int32_t findLeaf(geo::Point p, uint32_t id) const {
+        std::vector<int32_t> stack{root};
+        while (!stack.empty()) {
+            int32_t n = stack.back();
+            stack.pop_back();
+            if (!nodes[n].box.contains(p)) continue;
+            if (!nodes[n].leaf) {
+                stack.insert(stack.end(), nodes[n].kids.begin(), nodes[n].kids.end());
+                continue;
+            }
+            for (const Item& it : nodes[n].items)
+                if (it.id == id) return n;
+        }
+        return -1;
+    }
+
+    void collect(int32_t n, std::vector<Item>& out) const {
+        out.insert(out.end(), nodes[n].items.begin(), nodes[n].items.end());
+        for (int32_t k : nodes[n].kids) collect(k, out);
+    }
+
+    void remove(geo::Point p, uint32_t id) {
+        int32_t n = findLeaf(p, id);
+        auto& v = nodes[n].items;
+        *std::find_if(v.begin(), v.end(), [&](const Item& it) { return it.id == id; }) = v.back();
+        v.pop_back();
+
+        // Condense: unlink underfull nodes on the way up and reinsert their points afterwards.
+        std::vector<Item> orphans;
+        for (; nodes[n].parent >= 0; n = nodes[n].parent) {
+            size_t size = nodes[n].leaf ? nodes[n].items.size() : nodes[n].kids.size();
+            if (size < kMin) {
+                auto& kids = nodes[nodes[n].parent].kids;
+                kids.erase(std::find(kids.begin(), kids.end(), n));
+                collect(n, orphans);
+            } else {
+                recompute(n);
+            }
+        }
+        recompute(root);
+        while (!nodes[root].leaf && nodes[root].kids.size() == 1) {
+            root = nodes[root].kids[0];
+            nodes[root].parent = -1;
+        }
+        if (!nodes[root].leaf && nodes[root].kids.empty()) nodes[root].leaf = true;
+        for (const Item& it : orphans) insert(it.p, it.id);
+    }
+
+    void build(const std::vector<geo::Point>& p) {
+        nodes.assign(1, {});
+        root = 0;
+        for (uint32_t i = 0; i < p.size(); ++i) insert(p[i], i);
+    }
+    void move(uint32_t id, geo::Point from, geo::Point to) {
+        remove(from, id);
+        insert(to, id);
+    }
+
+    void radius(geo::Point c, double rKm, std::vector<uint32_t>& out) const {
+        out.clear();
+        double r2 = rKm * rKm;
+        std::vector<int32_t> stack{root};
+        while (!stack.empty()) {
+            const Node& n = nodes[stack.back()];
+            stack.pop_back();
+            if (n.items.empty() && n.kids.empty()) continue;
+            if (geo::minDist2(c, n.box) > r2) continue;
+            for (const Item& it : n.items)
+                if (geo::dist2(c, it.p) <= r2) out.push_back(it.id);
+            stack.insert(stack.end(), n.kids.begin(), n.kids.end());
+        }
+    }
+    void knn(geo::Point c, size_t k, std::vector<uint32_t>& out) const {
+        geo::KnnHeap heap{k};
+        std::priority_queue<std::pair<double, int32_t>, std::vector<std::pair<double, int32_t>>, std::greater<>> pq;
+        pq.emplace(0.0, root);
+        while (!pq.empty() && pq.top().first <= heap.worst()) {
+            const Node& n = nodes[pq.top().second];
+            pq.pop();
+            for (const Item& it : n.items) heap.push(geo::dist2(c, it.p), it.id);
+            for (int32_t kid : n.kids) pq.emplace(geo::minDist2(c, nodes[kid].box), kid);
+        }
+        heap.drain(out);
+    }
+};
