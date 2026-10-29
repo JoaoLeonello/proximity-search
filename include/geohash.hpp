@@ -5,6 +5,7 @@
 // of the sorted codes, so a lookup is a handful of binary searches (Redis GEO works this way).
 #include <unordered_map>
 #include "geo.hpp"
+#include "paged.hpp"
 
 namespace gh {
 
@@ -23,6 +24,24 @@ inline uint64_t interleave(uint32_t x, uint32_t y) { return spread(x) << 1 | spr
 inline uint32_t cellX(double lng, int bits) { return uint32_t((lng + 180.0) / 360.0 * double(1u << bits)); }
 inline uint32_t cellY(double lat, int bits) { return uint32_t((lat + 90.0) / 180.0 * double(1u << bits)); }
 
+// Classic geohash search: pick the finest precision whose cell is still >= r, then visit the
+// code range [lo, hi) of the query's cell and of its 8 neighbours. The circle can never leave
+// that 3x3 block.
+template <class F>
+void forEachNeighbourRange(geo::Point c, double rKm, F f) {
+    double coarsest = std::min(360.0 * geo::kKmPerDegLng, 180.0 * geo::kKmPerDegLat);
+    int bits = std::clamp(int(std::floor(std::log2(coarsest / rKm))), 1, kBits);
+    int shift = 2 * (kBits - bits);
+    int64_t cx = cellX(c.lng, bits), cy = cellY(c.lat, bits);
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            uint64_t prefix = interleave(uint32_t(cx + dx), uint32_t(cy + dy));
+            f(prefix << shift, (prefix + 1) << shift);
+        }
+}
+
+inline uint64_t code(geo::Point p) { return interleave(cellX(p.lng, kBits), cellY(p.lat, kBits)); }
+
 }  // namespace gh
 
 struct Geohash {
@@ -36,30 +55,59 @@ struct Geohash {
         rows.clear();
         rows.reserve(p.size());
         for (uint32_t i = 0; i < p.size(); ++i)
-            rows.push_back({gh::interleave(gh::cellX(p[i].lng, gh::kBits), gh::cellY(p[i].lat, gh::kBits)),
-                            p[i].lat, p[i].lng, i});
+            rows.push_back({gh::code(p[i]), p[i].lat, p[i].lng, i});
         std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.code < b.code; });
     }
 
-    // Classic geohash search: pick the finest precision whose cell is still >= r, then scan
-    // the query's cell plus its 8 neighbours. The circle can never leave that 3x3 block.
     void radius(geo::Point c, double rKm, std::vector<uint32_t>& out) const {
         out.clear();
         double r2 = rKm * rKm;
-        double coarsest = std::min(360.0 * geo::kKmPerDegLng, 180.0 * geo::kKmPerDegLat);
-        int bits = std::clamp(int(std::floor(std::log2(coarsest / rKm))), 1, gh::kBits);
-        int shift = 2 * (gh::kBits - bits);
-        int64_t cx = gh::cellX(c.lng, bits), cy = gh::cellY(c.lat, bits);
+        gh::forEachNeighbourRange(c, rKm, [&](uint64_t lo, uint64_t hi) {
+            auto it = std::lower_bound(rows.begin(), rows.end(), lo,
+                                       [](const Row& r, uint64_t v) { return r.code < v; });
+            for (; it != rows.end() && it->code < hi; ++it)
+                if (geo::dist2(c, {it->lat, it->lng}) <= r2) out.push_back(it->id);
+        });
+    }
+    void knn(geo::Point c, size_t k, std::vector<uint32_t>& out) const {
+        geo::knnByExpandingRadius(*this, *pts, c, k, out);
+    }
+};
 
-        for (int dy = -1; dy <= 1; ++dy)
-            for (int dx = -1; dx <= 1; ++dx) {
-                uint64_t prefix = gh::interleave(uint32_t(cx + dx), uint32_t(cy + dy));
-                uint64_t lo = prefix << shift, hi = (prefix + 1) << shift;
-                auto it = std::lower_bound(rows.begin(), rows.end(), lo,
-                                           [](const Row& r, uint64_t v) { return r.code < v; });
-                for (; it != rows.end() && it->code < hi; ++it)
-                    if (geo::dist2(c, {it->lat, it->lng}) <= r2) out.push_back(it->id);
-            }
+// Geohash for moving points. A sorted vector would shift the whole array on every move, so the
+// codes live in a paged B+tree instead: a move is erase(old code) + insert(new code), touching
+// one page. Redis GEOADD does the same over a sorted set.
+struct MovingGeohash {
+    static constexpr const char* name = "Geohash";
+    struct Row {
+        uint64_t code; double lat, lng; uint32_t id;
+        bool operator<(const Row& o) const { return code != o.code ? code < o.code : id < o.id; }
+    };
+    PagedSet<Row> rows;
+    const std::vector<geo::Point>* pts{};
+
+    static Row row(geo::Point p, uint32_t id) { return {gh::code(p), p.lat, p.lng, id}; }
+
+    void build(const std::vector<geo::Point>& p) {
+        pts = &p;
+        std::vector<Row> r(p.size());
+        for (uint32_t i = 0; i < p.size(); ++i) r[i] = row(p[i], i);
+        rows.build(std::move(r));
+    }
+    void move(uint32_t id, geo::Point from, geo::Point to) {
+        rows.erase(row(from, id));
+        rows.insert(row(to, id));
+    }
+    void radius(geo::Point c, double rKm, std::vector<uint32_t>& out) const {
+        out.clear();
+        double r2 = rKm * rKm;
+        gh::forEachNeighbourRange(c, rKm, [&](uint64_t lo, uint64_t hi) {
+            rows.scanFrom({lo, 0, 0, 0}, [&](const Row& r) {
+                if (r.code >= hi) return false;
+                if (geo::dist2(c, {r.lat, r.lng}) <= r2) out.push_back(r.id);
+                return true;
+            });
+        });
     }
     void knn(geo::Point c, size_t k, std::vector<uint32_t>& out) const {
         geo::knnByExpandingRadius(*this, *pts, c, k, out);

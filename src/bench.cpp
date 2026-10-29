@@ -84,6 +84,24 @@ static void buildAll(const char* title, Tuple& idx, const Data& data) {
     }, idx);
 }
 
+// Each index applies the same moves once (they change state, so there is no best of 3).
+// Indexes without move(), i.e. the naive scan, just read the updated array and are skipped.
+template <class Tuple>
+static void moveAll(const char* title, Tuple& idx, const std::vector<geo::Move>& moves) {
+    std::printf("\n### %s\n\n_%s location updates_\n\n| Structure | µs / update | updates / s |\n|---|---:|---:|\n",
+                title, thousands(double(moves.size())).c_str());
+    std::apply([&](auto&... ix) {
+        auto one = [&](auto& index) {
+            if constexpr (requires { index.move(0u, geo::Point{}, geo::Point{}); }) {
+                double us = elapsedUs([&] { for (const auto& m : moves) index.move(m.id, m.from, m.to); });
+                us /= double(moves.size());
+                std::printf("| %s | %.2f | %s |\n", index.name, us, thousands(1e6 / us).c_str());
+            }
+        };
+        (one(ix), ...);
+    }, idx);
+}
+
 static std::string cpuName() {
     std::ifstream f("/proc/cpuinfo");
     for (std::string line; std::getline(f, line);)
@@ -123,6 +141,16 @@ int main(int argc, char** argv) {
              [](const auto& ix, geo::Point q, auto& out) { ix.containing(q, out); });
     scenario("6. Polygon overlap (\"which zones overlap this new zone?\")", zoneIdx, queryZones,
              [](const auto& ix, const geo::Polygon& q, auto& out) { ix.overlapping(q, out); });
+
+    // 7. Drivers move. Dynamic versions of each index are built from the same points, absorb the
+    // same GPS pings, and must still match the naive scan on the moved data afterwards.
+    std::tuple<Naive, MovingBTree, MovingGeohash, MovingQuadtree, DynamicRTree> movingIdx;
+    buildAll("Build: moving drivers (dynamic indexes)", movingIdx, points);
+    auto moves = geo::randomMoves(points, 10 * nQueries, 5);
+    moveAll("7. Moving drivers: location updates", movingIdx, moves);
+    scenario("7a. After the moves: radius 500 m", movingIdx, queryPoints, radius(0.5));
+    scenario("7b. After the moves: k = 1", movingIdx, queryPoints,
+             [](const auto& ix, geo::Point q, auto& out) { ix.knn(q, 1, out); });
 
     std::printf("\n%s\n", allCorrect ? "All structures match the naive scan. ✅" : "MISMATCH against naive scan. ❌");
     return allCorrect ? 0 : 1;

@@ -34,6 +34,15 @@ struct Quadtree {
         if (nodes[n].items.size() > kCap && depth < kMaxDepth) split(n);
     }
 
+    // shortcut: emptied quadrants are never merged back; fine for a random walk, add merging for long-lived churn.
+    void remove(geo::Point p, uint32_t id) {
+        int n = 0;
+        while (nodes[n].child >= 0) n = nodes[n].child + quadrant(nodes[n].box, p);
+        auto& v = nodes[n].items;
+        *std::find_if(v.begin(), v.end(), [&](const Item& it) { return it.id == id; }) = v.back();
+        v.pop_back();
+    }
+
     void build(const std::vector<geo::Point>& p) {
         geo::BBox root;
         for (auto& x : p) root.expand(x);
@@ -73,6 +82,21 @@ struct Quadtree {
             }
         }
         heap.drain(out);
+    }
+};
+
+// Same tree for moving points. The root covers the whole region, not just the initial points,
+// so a driver can move anywhere in it; a move is a local remove plus insert.
+struct MovingQuadtree : Quadtree {
+    void build(const std::vector<geo::Point>& p) {
+        geo::BBox root = geo::kRegion;
+        for (auto& x : p) root.expand(x);
+        nodes.assign(1, {root});
+        for (uint32_t i = 0; i < p.size(); ++i) insert(p[i], i);
+    }
+    void move(uint32_t id, geo::Point from, geo::Point to) {
+        remove(from, id);
+        insert(to, id);
     }
 };
 
