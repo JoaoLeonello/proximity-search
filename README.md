@@ -15,6 +15,8 @@ run against the queries real location apps make, and checked against a brute-for
 
 </div>
 
+![Quadtree over the benchmark data and nearest-neighbour timings](docs/cover.png)
+
 ## TL;DR
 
 There is no single fastest structure. Each scenario has a different winner, and the reasons are mechanical:
